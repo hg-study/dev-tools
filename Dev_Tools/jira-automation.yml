@@ -1,0 +1,198 @@
+name: Jira Automation
+
+on:
+  repository_dispatch:
+    types: [jira-issue-created]
+
+jobs:
+  create-issue-and-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: write
+    steps:
+      - name: GitHub 이슈 생성
+        id: create_issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueType = context.payload.client_payload.issue_type;
+            const summary = context.payload.client_payload.summary;
+            const description = context.payload.client_payload.description || '';
+            const jiraUrl = context.payload.client_payload.jira_url;
+
+            const labelMap = {
+              'Epic': 'epic',
+              'Task': 'task',
+              'Story': 'story',
+              'Feature': 'enhancement',
+              'Bug': 'bug'
+            };
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[${issueType.toUpperCase()}] ${summary}`,
+              body: `Jira: ${jiraUrl}\n\n## 체크리스트\n${description}`,
+              labels: [labelMap[issueType] || 'task']
+            });
+
+            return issue.data.number;
+
+      - name: Jira 이슈에 GitHub 링크 추가 (Remote Link)
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        with:
+          script: |
+            const issueKey = context.payload.client_payload.issue_key;
+            const jiraUrl = context.payload.client_payload.jira_url;
+            const issueNumber = ${{ steps.create_issue.outputs.result }};
+
+            if (!issueKey || !jiraUrl) {
+              core.warning('Jira issue_key 또는 jira_url이 payload에 없습니다. Jira 링크 추가를 건너뜁니다.');
+              return;
+            }
+
+            const jiraBaseUrlFromSecret = (process.env.JIRA_BASE_URL || '').trim();
+            const jiraEmail = (process.env.JIRA_EMAIL || '').trim();
+            const jiraToken = (process.env.JIRA_API_TOKEN || '').trim();
+
+            if (!jiraEmail || !jiraToken) {
+              core.warning('JIRA_EMAIL/JIRA_API_TOKEN 시크릿이 없어 Jira 링크 추가를 건너뜁니다.');
+              return;
+            }
+
+            let jiraBaseUrl = jiraBaseUrlFromSecret;
+            if (!jiraBaseUrl) {
+              try {
+                const u = new URL(jiraUrl);
+                jiraBaseUrl = u.origin;
+              } catch (e) {
+                core.warning(`jira_url 파싱 실패: ${String(e)}. Jira 링크 추가를 건너뜁니다.`);
+                return;
+              }
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const githubIssueUrl = `https://github.com/${owner}/${repo}/issues/${issueNumber}`;
+
+            const auth = Buffer.from(`${jiraEmail}:${jiraToken}`).toString('base64');
+            const endpoint = `${jiraBaseUrl.replace(/\/+$/, '')}/rest/api/3/issue/${encodeURIComponent(issueKey)}/remotelink`;
+
+            const payload = {
+              object: {
+                url: githubIssueUrl,
+                title: `GitHub Issue #${issueNumber}`,
+                icon: {
+                  url16x16: 'https://github.githubassets.com/favicons/favicon.png',
+                  title: 'GitHub'
+                }
+              }
+            };
+
+            const res = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Basic ${auth}`,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+
+            if (!res.ok) {
+              const text = await res.text().catch(() => '');
+              core.warning(`Jira remotelink 추가 실패 (${res.status}): ${text}`);
+              return;
+            }
+
+            core.info(`Jira(${issueKey})에 GitHub Issue 링크 추가 완료: ${githubIssueUrl}`);
+
+      - name: GitHub 브랜치 생성 및 Issue 직접 연결
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueType = context.payload.client_payload.issue_type;
+            const issueKey = context.payload.client_payload.issue_key;
+            const summary = context.payload.client_payload.summary;
+            const issueNumber = ${{ steps.create_issue.outputs.result }};
+
+            const prefixMap = {
+              'Epic': 'epic',
+              'Task': 'task',
+              'Story': 'story',
+              'Feature': 'feature',
+              'Bug': 'bugfix'
+            };
+
+            const prefix = prefixMap[issueType] || 'feature';
+
+            // 이슈 제목 브랜치명 처리 (공백→하이픈, 특수문자 제거, 소문자 변환, 최대 50자)
+            const sanitizedSummary = summary
+              .toLowerCase()
+              .replace(/\s+/g, '-')
+              .replace(/[^a-z0-9ㄱ-ㅎ가-힣-]/g, '')
+              .replace(/-+/g, '-')
+              .replace(/^-|-$/g, '')
+              .substring(0, 50);
+
+            const branchName = `${prefix}/${issueKey}-${sanitizedSummary}`;
+
+            // 1. develop SHA 조회
+            const develop = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'heads/develop'
+            });
+            const developSha = develop.data.object.sha;
+
+            // 2. Issue Node ID 조회
+            const issueData = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+            const issueNodeId = issueData.data.node_id;
+
+            // 3. Repo Node ID 조회
+            const repoData = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            const repoNodeId = repoData.data.node_id;
+
+            // 4. createLinkedBranch로 브랜치 생성 + Issue 직접 연결
+            await github.graphql(`
+              mutation($issueId: ID!, $branchName: String!, $repoId: ID!, $oid: GitObjectID!) {
+                createLinkedBranch(input: {
+                  issueId: $issueId,
+                  name: $branchName,
+                  repositoryId: $repoId,
+                  oid: $oid
+                }) {
+                  linkedBranch {
+                    id
+                    ref {
+                      name
+                    }
+                  }
+                }
+              }
+            `, {
+              issueId: issueNodeId,
+              branchName: branchName,
+              repoId: repoNodeId,
+              oid: developSha
+            });
+
+            // 5. 브랜치 생성 댓글
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `브랜치 생성 완료: \`${branchName}\``
+            });
